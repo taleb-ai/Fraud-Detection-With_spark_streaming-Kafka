@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Runtime data (run ./scripts/cleanup.sh to remove)
+data/metrics/
+data/transactions*.json
+data/*.parquet
+checkpoints/
+checkpoints/spark-local/
+*.parquet
+
+# Large samples (keep small examples only)
+data/transactions.json
+
+# IDE
+.idea/
+.vscode/

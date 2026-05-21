@@ -50,7 +50,7 @@ class UserGenerator:
         self.users: List[Dict] = []
 
     def _power_law_income(self, size: int, min_income: float = 1000.0,
-                          max_income: float = 100000.0,
+                          max_income: float = 1_000_000.0,
                           alpha: float = 2.0) -> np.ndarray:
         """Sample incomes from a power-law PDF P(I) ~ 1 / I**alpha.
 
@@ -93,7 +93,7 @@ class UserGenerator:
             Each dict contains user attributes used by the simulator.
         """
         total = self.N + self.M
-        logger.info("Generating %d users (%d X, %d external)", self.N, self.M)
+        logger.info("Generating %d users (%d bank X, %d external A/B)", total, self.N, self.M)
 
         # Sample incomes
         incomes = self._power_law_income(total)

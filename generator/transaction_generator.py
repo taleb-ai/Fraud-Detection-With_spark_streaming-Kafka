@@ -1,30 +1,21 @@
-"""Transaction generation logic for the banking fraud simulator.
-
-Provides `TransactionGenerator` which produces transactions per-second
-according to user probabilities and updates balances.
-"""
+"""Transaction generation logic for the banking fraud simulator (TP5 §4.3, §5.1)."""
 from __future__ import annotations
 
 import json
 import logging
-import uuid
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
+from .message_format import to_bank_message
+
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 
 class TransactionGenerator:
-    """Simulate transactions between users.
-
-    Parameters
-    ----------
-    users: list of dict
-        Users produced by `UserGenerator.generate_users()`
-    """
+    """Simulate transactions between users using per-second Bernoulli probabilities."""
 
     def __init__(self, users: List[Dict]) -> None:
         if not isinstance(users, list):
@@ -32,7 +23,6 @@ class TransactionGenerator:
         self.users = users
         self.n = len(users)
 
-        # Create fast-access arrays
         self.user_ids = [u["user_id"] for u in users]
         self.banks = [u["bank"] for u in users]
         self.monthly_incomes = np.array([u["monthly_income"] for u in users], dtype=float)
@@ -40,220 +30,189 @@ class TransactionGenerator:
         self.probs = np.array([u.get("prob_per_second", 0.0) for u in users], dtype=float)
         self.balances = np.array([u["balance"] for u in users], dtype=float)
 
-        # Map id -> index
-        self.id_to_index = {uid: idx for idx, uid in enumerate(self.user_ids)}
+        self.expected_tps = float(self.probs.sum())
+        logger.info(
+            "TransactionGenerator ready: %d users, expected ~%.2f tx/s from probabilities",
+            self.n,
+            self.expected_tps,
+        )
 
     def _sync_users(self) -> None:
-        """Write back balances to the user dicts."""
         for idx, u in enumerate(self.users):
             u["balance"] = float(self.balances[idx])
 
-    def generate_single_transaction(self, current_time: Optional[datetime] = None) -> Optional[Dict]:
-        """Generate a single transaction or return None if not possible.
+    def _sample_amount(self, sender_idx: int) -> float:
+        """Amount A ~ Uniform[Si - 2*sigma, Si + 2*sigma], sigma = Si/2 (spec §4.3)."""
+        si = float(self.avg_spending[sender_idx])
+        sigma = max(0.01, si / 2.0)
+        low = max(0.01, si - 2.0 * sigma)
+        high = si + 2.0 * sigma
+        return round(float(np.random.uniform(low, high)), 2)
 
-        The sender is chosen weighted by `prob_per_second`. The receiver is
-        chosen uniformly at random among other users.
-        """
-        if self.n < 2:
-            return None
-
-        p_sum = float(self.probs.sum())
-        if p_sum <= 0.0:
-            return None
-
-        # choose sender index
-        sender_idx = int(np.random.choice(self.n, p=(self.probs / p_sum)))
-
-        # choose receiver index uniformly (different from sender)
+    def _pick_receiver(self, sender_idx: int) -> int:
         receiver_idx = sender_idx
         while receiver_idx == sender_idx:
             receiver_idx = int(np.random.randint(0, self.n))
+        return receiver_idx
 
-        avg = float(self.avg_spending[sender_idx])
-        sigma = max(0.01, avg / 2.0)
-        amount = float(np.random.normal(loc=avg, scale=sigma))
-        amount = max(1.0, amount)
-        amount = float(round(amount, 2))
-
-        if amount > float(self.balances[sender_idx]):
-            # insufficient funds
-            return None
-
-        # perform transfer
-        self.balances[sender_idx] -= amount
-        self.balances[receiver_idx] += amount
-        self._sync_users()
-
-        tx = {
-            "transaction_id": str(uuid.uuid4()),
-            "timestamp": (current_time or datetime.utcnow()).isoformat() + "Z",
-            "sender_id": self.user_ids[sender_idx],
-            "sender_bank": self.banks[sender_idx],
-            "receiver_id": self.user_ids[receiver_idx],
-            "receiver_bank": self.banks[receiver_idx],
-            "amount": float(amount),
-            "sender_balance_after": float(round(self.balances[sender_idx], 2)),
-            "receiver_balance_after": float(round(self.balances[receiver_idx], 2)),
-        }
-        return tx
-
-    def generate_batch(self, target_tps: float = 1000.0, current_time: Optional[datetime] = None) -> List[Dict]:
-        """Generate transactions for a single second.
-
-        Parameters
-        ----------
-        target_tps: float
-            Expected transactions per second (Poisson mean)
-
-        Returns
-        -------
-        list of transaction dicts
-        """
-        if target_tps <= 0:
+    def generate_second_batch(self, current_time: Optional[datetime] = None) -> List[Dict]:
+        """Generate all transactions for one simulated second (vectorized Bernoulli)."""
+        if self.n < 2:
             return []
 
-        num = int(np.random.poisson(lam=float(target_tps)))
+        ts = current_time or datetime.now(timezone.utc)
+        active_mask = np.random.random(self.n) < self.probs
+        sender_indices = np.flatnonzero(active_mask)
+        if sender_indices.size == 0:
+            return []
+
         txs: List[Dict] = []
-        attempts = 0
-        max_attempts = max(1000, num * 10)
-        while len(txs) < num and attempts < max_attempts:
-            attempts += 1
-            tx = self.generate_single_transaction(current_time=current_time)
-            if tx is not None:
-                txs.append(tx)
+        for sender_idx in sender_indices:
+            sender_idx = int(sender_idx)
+            amount = self._sample_amount(sender_idx)
+            if amount > float(self.balances[sender_idx]):
+                continue
 
-        if attempts >= max_attempts and len(txs) < num:
-            logger.debug("Stopped early: produced %d/%d transactions", len(txs), num)
+            receiver_idx = self._pick_receiver(sender_idx)
+            self.balances[sender_idx] -= amount
+            self.balances[receiver_idx] += amount
 
+            txs.append(
+                to_bank_message(
+                    sender_id=self.user_ids[sender_idx],
+                    sender_bank=self.banks[sender_idx],
+                    receiver_id=self.user_ids[receiver_idx],
+                    receiver_bank=self.banks[receiver_idx],
+                    amount=amount,
+                    timestamp=ts,
+                )
+            )
+
+        if txs:
+            self._sync_users()
         return txs
 
     def add_monthly_deposits(self) -> None:
-        """Add each user's monthly_income to their balance (monthly deposit)."""
         self.balances += self.monthly_incomes
         self._sync_users()
         logger.info("Added monthly deposits to %d users", self.n)
 
-    def run_simulation(self, duration_seconds: int = 10, target_tps: float = 10.0,
-                       verbose: bool = True, start_time: Optional[datetime] = None) -> List[Dict]:
-        """Run the simulator for `duration_seconds` seconds.
+    def _maybe_monthly_deposit(self, current_time: datetime) -> None:
+        if (
+            current_time.day == 1
+            and current_time.hour == 0
+            and current_time.minute == 0
+            and current_time.second == 0
+        ):
+            self.add_monthly_deposits()
 
-        Parameters
-        ----------
-        duration_seconds: int
-            Number of seconds to simulate.
-        target_tps: float
-            Expected transactions per second.
-        verbose: bool
-            If True, logs progress.
-        start_time: datetime or None
-            Starting timestamp for generated transactions. Defaults to UTC now.
+    def run_continuous(
+        self,
+        *,
+        kafka_producer=None,
+        start_time: Optional[datetime] = None,
+        duration_seconds: int = 0,
+        real_time: bool = True,
+        prob_scale: float = 1.0,
+        fraud_rate: float = 0.0,
+        verbose: bool = True,
+        should_stop: Optional[Callable[[], bool]] = None,
+        on_batch: Optional[Callable[[List[Dict], int, float], None]] = None,
+    ) -> Dict:
+        """Run simulation loop (infinite if duration_seconds <= 0).
+
+        Returns summary stats dict.
         """
-        if duration_seconds <= 0:
-            return []
+        original_probs = None
+        if prob_scale != 1.0:
+            original_probs = self.probs.copy()
+            self.probs = np.minimum(original_probs * prob_scale, 1.0)
+            self.expected_tps = float(self.probs.sum())
+            logger.info("Applied prob_scale=%.2f -> expected ~%.1f tx/s", prob_scale, self.expected_tps)
 
-        current_time = start_time or datetime.utcnow()
-        txs: List[Dict] = []
+        current_time = start_time or datetime.now(timezone.utc)
+        sec = 0
+        total_txs = 0
+        total_sent_kafka = 0
+        loop_start = time.monotonic()
+        last_log = loop_start
 
-        for sec in range(duration_seconds):
-            # check monthly deposit: if current_time is 1st day at midnight
-            if current_time.day == 1 and current_time.hour == 0 and current_time.minute == 0 and current_time.second == 0:
-                self.add_monthly_deposits()
+        stop = should_stop or (lambda: False)
+        mode = "infinite" if duration_seconds <= 0 else f"{duration_seconds}s"
+        logger.info(
+            "Starting continuous simulation (%s, real_time=%s, kafka=%s)",
+            mode,
+            real_time,
+            kafka_producer is not None,
+        )
 
-            batch = self.generate_batch(target_tps=target_tps, current_time=current_time)
-            txs.extend(batch)
+        try:
+            while not stop():
+                if duration_seconds > 0 and sec >= duration_seconds:
+                    break
 
-            if verbose and (sec % max(1, duration_seconds // 10) == 0):
-                logger.info("Simulated second %d/%d — generated %d txs (cumulative %d)",
-                            sec + 1, duration_seconds, len(batch), len(txs))
+                tick_start = time.monotonic()
+                self._maybe_monthly_deposit(current_time)
+                batch = self.generate_second_batch(current_time=current_time)
+                if fraud_rate > 0:
+                    from .fraud_injection import inject_fraud
 
-            current_time += timedelta(seconds=1)
+                    batch = inject_fraud(
+                        batch, self.users, fraud_rate=fraud_rate, current_time=current_time
+                    )
 
-        logger.info("Simulation complete: produced %d transactions", len(txs))
-        return txs
+                if kafka_producer is not None and batch:
+                    sent = kafka_producer.send_batch(batch)
+                    total_sent_kafka += sent
+                    if sent != len(batch):
+                        logger.warning("Kafka delivery incomplete: %d/%d", sent, len(batch))
+
+                total_txs += len(batch)
+                if on_batch is not None:
+                    on_batch(batch, sec, time.monotonic() - loop_start)
+
+                now = time.monotonic()
+                if verbose and (now - last_log >= 10.0 or sec < 3):
+                    elapsed = now - loop_start
+                    tps = total_txs / elapsed if elapsed > 0 else 0.0
+                    logger.info(
+                        "sec=%d batch=%d cumulative=%d kafka_sent=%d avg_tps=%.1f",
+                        sec + 1,
+                        len(batch),
+                        total_txs,
+                        total_sent_kafka,
+                        tps,
+                    )
+                    last_log = now
+
+                sec += 1
+                current_time += timedelta(seconds=1)
+
+                if real_time:
+                    elapsed_tick = time.monotonic() - tick_start
+                    sleep_for = max(0.0, 1.0 - elapsed_tick)
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+        finally:
+            if original_probs is not None:
+                self.probs = original_probs
+                self.expected_tps = float(self.probs.sum())
+
+        elapsed = time.monotonic() - loop_start
+        summary = {
+            "seconds_simulated": sec,
+            "total_transactions": total_txs,
+            "total_sent_kafka": total_sent_kafka,
+            "elapsed_wall_seconds": elapsed,
+            "average_tps": total_txs / elapsed if elapsed > 0 else 0.0,
+        }
+        logger.info("Simulation stopped: %s", summary)
+        return summary
 
     def save_transactions(self, transactions: List[Dict], filename: str) -> None:
-        """Save transactions to a JSON file.
+        import os
 
-        Parameters
-        ----------
-        transactions: list of dict
-            Transaction dicts as produced by the generator.
-        filename: str
-            Destination file path.
-        """
-        try:
-            import os
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(transactions, f, indent=2)
-            logger.info("Saved %d transactions to %s", len(transactions), filename)
-        except Exception:
-            logger.exception("Failed to save transactions to %s", filename)
-            raise
-
-    def run_simulation_with_kafka(self, duration_seconds: int = 10, target_tps: float = 10,
-                                   kafka_producer=None, verbose: bool = True,
-                                   start_time: Optional[datetime] = None) -> List[Dict]:
-        """Run the simulator and send transactions to Kafka in real-time.
-
-        This method combines simulation with live Kafka streaming. If no Kafka
-        producer is provided, falls back to regular simulation.
-
-        Parameters
-        ----------
-        duration_seconds: int
-            Number of seconds to simulate.
-        target_tps: float
-            Expected transactions per second.
-        kafka_producer: KafkaTransactionProducer or None
-            Kafka producer instance. If None, uses run_simulation() as fallback.
-        verbose: bool
-            If True, logs progress.
-        start_time: datetime or None
-            Starting timestamp for generated transactions. Defaults to UTC now.
-
-        Returns
-        -------
-        list of dict
-            All transactions generated during simulation.
-        """
-        if kafka_producer is None:
-            logger.warning("No Kafka producer provided, falling back to regular simulation")
-            return self.run_simulation(duration_seconds=duration_seconds, target_tps=target_tps,
-                                      verbose=verbose, start_time=start_time)
-
-        if duration_seconds <= 0:
-            return []
-
-        current_time = start_time or datetime.utcnow()
-        txs: List[Dict] = []
-
-        logger.info("Starting simulation with Kafka streaming (duration=%ds, target_tps=%.1f)",
-                    duration_seconds, target_tps)
-
-        for sec in range(duration_seconds):
-            # check monthly deposit: if current_time is 1st day at midnight
-            if current_time.day == 1 and current_time.hour == 0 and current_time.minute == 0 and current_time.second == 0:
-                self.add_monthly_deposits()
-
-            batch = self.generate_batch(target_tps=target_tps, current_time=current_time)
-
-            # Send to Kafka
-            if batch:
-                try:
-                    count = kafka_producer.send_batch(batch)
-                    if verbose:
-                        logger.info("Sent %d/%d transactions to Kafka", count, len(batch))
-                except Exception as e:
-                    logger.error("Error sending batch to Kafka: %s", e)
-
-            txs.extend(batch)
-
-            if verbose and (sec % max(1, duration_seconds // 10) == 0):
-                logger.info("Simulated second %d/%d — generated %d txs (cumulative %d)",
-                            sec + 1, duration_seconds, len(batch), len(txs))
-
-            current_time += timedelta(seconds=1)
-
-        logger.info("Simulation with Kafka complete: produced and sent %d transactions", len(txs))
-        return txs
+        os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(transactions, f, indent=2)
+        logger.info("Saved %d transactions to %s", len(transactions), filename)

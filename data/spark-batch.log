@@ -1,0 +1,2 @@
+2026-05-21T15:22:44.303633+00:00 job_start metrics_dir=/workspace/data/metrics kafka=kafka:9092 topic=transactions offsets=earliest trigger=10 seconds
+2026-05-21T15:23:03.477679+00:00 process_batch_ok batch_id=0 rows=1 path=/workspace/data/metrics/recent_transactions.parquet
